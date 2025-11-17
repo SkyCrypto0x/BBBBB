@@ -5,12 +5,17 @@ import { registerBuyBotFeature } from "./feature.buyBot";
 async function main() {
   const bot = new Telegraf(appConfig.telegramBotToken);
 
+  // Register /start + setup flow
   registerBuyBotFeature(bot);
 
-  await bot.launch();
-  console.log("Buy bot setup flow running…");
+  // Optional: command list
+  await bot.telegram.setMyCommands([
+    { command: "start", description: "Start / configure the buy bot" }
+  ]);
 
-  // graceful stop (optional)
+  await bot.launch();
+  console.log("✅ Buy bot is running…");
+
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
 }

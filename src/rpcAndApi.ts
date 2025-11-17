@@ -20,7 +20,7 @@ export const appConfig: AppConfig = JSON.parse(
   readFileSync(path.join(__dirname, "..", "config.json"), "utf8")
 );
 
-// === DexScreener: token address → best pair address ===
+// 🔍 DexScreener: token address → best pair address
 // Docs: https://api.dexscreener.com/token-pairs/v1/{chainId}/{tokenAddress}
 export async function resolvePairFromToken(
   chain: ChainId,
@@ -38,7 +38,7 @@ export async function resolvePairFromToken(
       return null;
     }
 
-    // choose pair with highest liquidity.usd
+    // highest liquidity pair = main pair
     let best = data[0];
     for (const p of data) {
       const bestLiq = Number(best?.liquidity?.usd ?? 0);
