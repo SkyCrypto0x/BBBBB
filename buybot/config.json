@@ -1,0 +1,17 @@
+{
+  "telegramBotToken": "YOUR_TELEGRAM_BOT_TOKEN",
+  "botUsername": "YourBotUserNameWithoutAt",
+
+  "defaultChain": "bsc",
+
+  "chains": {
+    "bsc": {
+      "rpcUrl": "https://bsc-dataseed.binance.org/",
+      "explorer": "https://bscscan.com"
+    },
+    "ethereum": {
+      "rpcUrl": "https://rpc.ankr.com/eth",
+      "explorer": "https://etherscan.io"
+    }
+  }
+}
