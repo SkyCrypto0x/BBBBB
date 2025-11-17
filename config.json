@@ -6,7 +6,7 @@
 
   "chains": {
     "bsc": {
-      "rpcUrl": "https://bsc-dataseed.binance.org/",
+      "rpcUrl": "wss://proportionate-falling-morning.bsc.quiknode.pro/ef340006d869e9351618f50a21e0651af780c88a",
       "explorer": "https://bscscan.com"
     },
     "ethereum": {

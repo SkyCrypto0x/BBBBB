@@ -1,10 +1,18 @@
 import { Telegraf, Context, Markup } from "telegraf";
-import { appConfig, ChainId, resolvePairFromToken } from "./rpcAndApi";
+import {
+  appConfig,
+  ChainId,
+  fetchTokenPairs,
+  DexPair
+} from "./rpcAndApi";
 
 export interface BuyBotSettings {
   chain: ChainId;
   tokenAddress: string;
+  // main pair (highest liquidity)
   pairAddress: string;
+  // all pools for this token on this chain (including main)
+  allPairAddresses: string[];
   emoji: string;
   imageUrl?: string;
   minBuyUsd: number;
@@ -41,13 +49,13 @@ interface DmSetupState extends BaseSetupState {
 // Group flow: per-group state
 interface GroupSetupState extends BaseSetupState {}
 
-const dmSetupStates = new Map<number, DmSetupState>();      // userId -> state
+const dmSetupStates = new Map<number, DmSetupState>(); // userId -> state
 const groupSetupStates = new Map<number, GroupSetupState>(); // chatId -> state
 
 type BotCtx = Context;
 
 export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
-  // 🔹 /start – DM + group দুদিকেই premium UX
+  // 🔹 /start – DM + group premium UX
   bot.start(async (ctx) => {
     const chat = ctx.chat;
     if (!chat) return;
@@ -70,7 +78,7 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
       await ctx.reply(
         "🕵️ <b>Premium Buy Bot Setup</b>\n\n" +
           "1️⃣ Send your <b>token contract address</b>.\n" +
-          "I'll auto-detect your main pair from DexScreener.",
+          "I'll auto-detect <u>all pools</u> from DexScreener and pick the main one.",
         { parse_mode: "HTML" }
       );
       return;
@@ -82,10 +90,10 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
 
       await ctx.reply(
         "🕵️ <b>Premium Buy Bot</b>\n\n" +
-          "• Tracks every buy for your token\n" +
-          "• Beautiful GIF/emoji alerts\n" +
+          "• Tracks buys for your token\n" +
+          "• Uses all DexScreener pools\n" +
           "• Min & max buy filters\n" +
-          "• Designed for degen + pro projects.\n\n" +
+          "• Custom emoji + GIF alerts\n\n" +
           "➊ Press the button below to <b>add me to your group</b>.\n" +
           "➋ In the group, use <code>/add</code> to configure.",
         {
@@ -174,14 +182,77 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
     await ctx.reply(
       "🕵️ <b>Group Setup Mode</b>\n\n" +
         "1️⃣ Reply with your <b>token contract address</b>.\n" +
-        "I'll auto-detect the main pair from DexScreener.",
+        "I'll auto-detect all pools from DexScreener.",
       { parse_mode: "HTML" }
     );
 
     await ctx.answerCbQuery();
   });
 
-  // 🔹 Text handler – DM + group wizard (token → emoji → gif → min/max buy → $/emoji → group link)
+  // 🔹 Test command: /testbuy 299  → premium-style alert preview
+  bot.command("testbuy", async (ctx) => {
+    const chat = ctx.chat;
+    if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) {
+      await ctx.reply("Use /testbuy inside a group where the bot is configured.");
+      return;
+    }
+
+    const settings = groupSettings.get(chat.id);
+    if (!settings) {
+      await ctx.reply(
+        "No settings yet for this group.\nRun <code>/add</code> to configure first.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const parts = ctx.message.text.split(/\s+/);
+    const usdVal = parts[1] ? Number(parts[1]) : 123;
+    if (isNaN(usdVal) || usdVal <= 0) {
+      await ctx.reply("Usage: /testbuy 250   (amount in USD)");
+      return;
+    }
+
+    // respect min/max filters
+    if (usdVal < settings.minBuyUsd) {
+      await ctx.reply(
+        `🚫 Test buy $${usdVal.toFixed(
+          2
+        )} is below min buy $${settings.minBuyUsd.toFixed(2)} (alert skipped).`
+      );
+      return;
+    }
+    if (settings.maxBuyUsd && usdVal > settings.maxBuyUsd) {
+      await ctx.reply(
+        `🚫 Test buy $${usdVal.toFixed(
+          2
+        )} is above max buy $${settings.maxBuyUsd.toFixed(2)} (alert skipped).`
+      );
+      return;
+    }
+
+    const mainPairUrl = `https://dexscreener.com/${settings.chain}/${settings.pairAddress}`;
+    const emojiCount = Math.min(
+      30,
+      Math.max(1, Math.round(usdVal / settings.dollarsPerEmoji))
+    );
+    const emojiBar = settings.emoji.repeat(emojiCount);
+
+    const text =
+      "🧠 <b>Premium Buy Alert (TEST)</b>\n\n" +
+      `<b>$${usdVal.toFixed(2)} BUY!</b>\n` +
+      `${emojiBar}\n\n` +
+      `🪙 <b>Token:</b> <code>${shorten(settings.tokenAddress)}</code>\n` +
+      `🧬 <b>Main pair:</b> <code>${shorten(settings.pairAddress)}</code>\n` +
+      (settings.allPairAddresses.length > 1
+        ? `🌊 <b>Total pools:</b> ${settings.allPairAddresses.length}\n`
+        : "") +
+      `📊 <a href="${mainPairUrl}">DexScreener chart</a>\n`;
+
+    await ctx.reply(text, { parse_mode: "HTML" });
+  });
+
+  // 🔹 Text handler – DM + group wizard
   bot.on("text", async (ctx, next) => {
     const chat = ctx.chat;
     if (!chat) return next();
@@ -220,7 +291,9 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
 
         await ctx.reply(
           "✅ Premium setup complete for this group!\n" +
-            "The buy bot is ready. (On-chain listener will use these settings.)"
+            "Use <code>/testbuy 250</code> to preview alerts.\n" +
+            "Next step: connect real on-chain buys to this config.",
+          { parse_mode: "HTML" }
         );
       }
       return;
@@ -230,7 +303,7 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
   });
 }
 
-// 🔧 Shared wizard logic (DM + group) – ekdom premium steps
+// 🔧 Shared wizard logic (DM + group) – token → all pairs → emoji → gif → min/max → $/emoji → group link
 async function runSetupStep(
   ctx: Context,
   state: BaseSetupState,
@@ -239,35 +312,51 @@ async function runSetupStep(
   switch (state.step) {
     case "token": {
       state.settings.tokenAddress = text;
-      await ctx.reply("🔎 Searching main pair on DexScreener…");
+      const chain = state.settings.chain || appConfig.defaultChain;
 
-      const pair = await resolvePairFromToken(
-        state.settings.chain || appConfig.defaultChain,
-        text
-      );
+      await ctx.reply("🔎 Fetching pools from DexScreener…");
 
-      if (!pair) {
+      const pairs = await fetchTokenPairs(chain, text);
+      if (!pairs.length) {
         state.step = "pair";
         await ctx.reply(
-          "❌ Could not auto-detect pair.\n\n" +
+          "❌ No pools found for this token on DexScreener.\n\n" +
             "2️⃣ Please send the <b>pair address</b> (DEX pool) for your token.",
           { parse_mode: "HTML" }
         );
         return null;
       }
 
-      state.settings.pairAddress = pair;
+      const sorted = sortPairsByLiquidity(pairs);
+      const main = sorted[0];
+      const allAddresses = sorted.map((p) => p.pairAddress);
+
+      state.settings.pairAddress = main.pairAddress;
+      (state.settings as any).allPairAddresses = allAddresses;
+
+      let summary =
+        `✅ Found <b>${sorted.length}</b> pools on DexScreener.\n\n` +
+        `<b>Main pair:</b>\n<code>${main.pairAddress}</code>\n\n`;
+
+      if (sorted.length > 1) {
+        const others = sorted
+          .slice(1, 4)
+          .map((p) => `• ${p.pairAddress}`)
+          .join("\n");
+        summary += `<b>Other pools (top liq):</b>\n${others}\n\n`;
+      }
+
+      await ctx.reply(summary + "3️⃣ Now send a <b>buy emoji</b> (e.g. 🐶, 🧠, 🚀).", {
+        parse_mode: "HTML"
+      });
+
       state.step = "emoji";
-      await ctx.reply(
-        `✅ Found main pair:\n<code>${pair}</code>\n\n` +
-          "3️⃣ Now send a <b>buy emoji</b> (e.g. 🐶, 🧠, 🚀).",
-        { parse_mode: "HTML" }
-      );
       return null;
     }
 
     case "pair": {
       state.settings.pairAddress = text;
+      (state.settings as any).allPairAddresses = [text];
       state.step = "emoji";
       await ctx.reply(
         "3️⃣ Choose a buy emoji (send just one emoji, e.g. 🐶 or 🧠)."
@@ -355,10 +444,15 @@ async function runSetupStep(
       state.settings.autoPinDataPosts = false;
       state.settings.autoPinKolAlerts = false;
 
+      const allPairs =
+        (state.settings as any).allPairAddresses ??
+        (state.settings.pairAddress ? [state.settings.pairAddress] : []);
+
       const finalSettings: BuyBotSettings = {
         chain: state.settings.chain || appConfig.defaultChain,
         tokenAddress: state.settings.tokenAddress!,
         pairAddress: state.settings.pairAddress!,
+        allPairAddresses: allPairs,
         emoji: state.settings.emoji || "🟢",
         imageUrl: state.settings.imageUrl,
         minBuyUsd: state.settings.minBuyUsd ?? 0,
@@ -376,21 +470,30 @@ async function runSetupStep(
   return null;
 }
 
+// sort by liquidity.usd desc
+function sortPairsByLiquidity(pairs: DexPair[]): DexPair[] {
+  return [...pairs].sort((a, b) => {
+    const la = Number(a?.liquidity?.usd ?? 0);
+    const lb = Number(b?.liquidity?.usd ?? 0);
+    return lb - la;
+  });
+}
+
+function shorten(addr: string, len = 6): string {
+  if (!addr || addr.length <= len * 2) return addr;
+  return addr.slice(0, len) + "..." + addr.slice(-len);
+}
+
 // Small helper: nice help text in group
 async function sendGroupHelp(ctx: Context) {
-  const chat = ctx.chat!;
-  const addCmd = "/add";
-
   await ctx.reply(
     "🕵️ <b>Premium Buy Bot</b>\n\n" +
-      "Use <code>" +
-      addCmd +
-      "</code> to configure this group.\n\n" +
+      "• Use <code>/add</code> to configure this group.\n" +
+      "• Then use <code>/testbuy 250</code> to preview alerts.\n\n" +
       "Flow:\n" +
       "1) Run <code>/add</code>\n" +
       "2) Choose <b>Set up in DM</b> or <b>Set up here</b>\n" +
-      "3) Token → Emoji → GIF → Min/Max buy → $ per emoji → Group link.\n\n" +
-      "Once finished, the bot will use those settings for buy alerts.",
+      "3) Token → all pools → emoji → GIF → min/max buy → $ per emoji → group link.\n",
     { parse_mode: "HTML" }
   );
 }
