@@ -9,15 +9,20 @@ import {
 export interface BuyBotSettings {
   chain: ChainId;
   tokenAddress: string;
-  // main pair (highest liquidity)
-  pairAddress: string;
-  // all pools for this token on this chain (including main)
+  pairAddress: string; // main pair
   allPairAddresses: string[];
   emoji: string;
-  imageUrl?: string;
+
+  // visual options
+  imageUrl?: string;          // http(s) url
+  imageFileId?: string;       // uploaded photo file_id
+  animationFileId?: string;   // uploaded gif/video file_id
+
+  // filters
   minBuyUsd: number;
   maxBuyUsd?: number;
   dollarsPerEmoji: number;
+
   tgGroupLink?: string;
   autoPinDataPosts: boolean;
   autoPinKolAlerts: boolean;
@@ -93,7 +98,7 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
           "• Tracks buys for your token\n" +
           "• Uses all DexScreener pools\n" +
           "• Min & max buy filters\n" +
-          "• Custom emoji + GIF alerts\n\n" +
+          "• Custom emoji + GIF / image alerts\n\n" +
           "➊ Press the button below to <b>add me to your group</b>.\n" +
           "➋ In the group, use <code>/add</code> to configure.",
         {
@@ -189,7 +194,7 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
     await ctx.answerCbQuery();
   });
 
-  // 🔹 Test command: /testbuy 299  → premium-style alert preview
+  // 🔹 /testbuy – premium-style test alert (with image/gif)
   bot.command("testbuy", async (ctx) => {
     const chat = ctx.chat;
     if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) {
@@ -231,12 +236,12 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
       return;
     }
 
-    const mainPairUrl = `https://dexscreener.com/${settings.chain}/${settings.pairAddress}`;
     const emojiCount = Math.min(
       30,
       Math.max(1, Math.round(usdVal / settings.dollarsPerEmoji))
     );
     const emojiBar = settings.emoji.repeat(emojiCount);
+    const mainPairUrl = `https://dexscreener.com/${settings.chain}/${settings.pairAddress}`;
 
     const text =
       "🧠 <b>Premium Buy Alert (TEST)</b>\n\n" +
@@ -247,9 +252,9 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
       (settings.allPairAddresses.length > 1
         ? `🌊 <b>Total pools:</b> ${settings.allPairAddresses.length}\n`
         : "") +
-      `📊 <a href="${mainPairUrl}">DexScreener chart</a>\n`;
+      `📊 <a href="${mainPairUrl}">DexScreener chart</a>`;
 
-    await ctx.reply(text, { parse_mode: "HTML" });
+    await sendVisualAlert(ctx, settings, text);
   });
 
   // 🔹 Text handler – DM + group wizard
@@ -301,9 +306,58 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
 
     return next();
   });
+
+  // 🔹 Photo / GIF handler – only used on “image” step
+  bot.on(["photo", "animation"], async (ctx, next) => {
+    const chat = ctx.chat;
+    if (!chat) return next();
+
+    // find current state (DM or group)
+    let state: BaseSetupState | undefined;
+
+    if (chat.type === "private") {
+      const userId = ctx.from!.id;
+      state = dmSetupStates.get(userId);
+    } else if (chat.type === "group" || chat.type === "supergroup") {
+      state = groupSetupStates.get(chat.id);
+    }
+
+    if (!state || state.step !== "image") {
+      return next();
+    }
+
+    // photo upload
+    if ("photo" in ctx.message && ctx.message.photo?.length) {
+      const photos = ctx.message.photo;
+      const best = photos[photos.length - 1];
+      (state.settings as any).imageFileId = best.file_id;
+
+      state.step = "minBuy";
+      await ctx.reply(
+        "📸 Image saved!\n\n5️⃣ Send <b>minimum $ buy</b> that will trigger an alert (e.g. 50).",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // gif / animation upload
+    if ("animation" in ctx.message && ctx.message.animation) {
+      const anim = ctx.message.animation;
+      (state.settings as any).animationFileId = anim.file_id;
+
+      state.step = "minBuy";
+      await ctx.reply(
+        "🎞 GIF saved!\n\n5️⃣ Send <b>minimum $ buy</b> that will trigger an alert (e.g. 50).",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    return next();
+  });
 }
 
-// 🔧 Shared wizard logic (DM + group) – token → all pairs → emoji → gif → min/max → $/emoji → group link
+// 🔧 Shared wizard logic (DM + group)
 async function runSetupStep(
   ctx: Context,
   state: BaseSetupState,
@@ -368,19 +422,27 @@ async function runSetupStep(
       state.settings.emoji = text;
       state.step = "image";
       await ctx.reply(
-        "4️⃣ Send an <b>image / gif URL</b> to show in each buy alert, or type <code>skip</code>.",
+        "4️⃣ Send an <b>image / gif</b> (upload) or an <b>image/gif URL</b> to show in each buy alert, or type <code>skip</code>.",
         { parse_mode: "HTML" }
       );
       return null;
     }
 
     case "image": {
-      if (text.toLowerCase() !== "skip") {
-        state.settings.imageUrl = text;
+      if (text.toLowerCase() === "skip") {
+        state.step = "minBuy";
+        await ctx.reply(
+          "5️⃣ Send <b>minimum $ buy</b> that will trigger an alert (e.g. 50).",
+          { parse_mode: "HTML" }
+        );
+        return null;
       }
+
+      // if user pasted URL
+      (state.settings as any).imageUrl = text;
       state.step = "minBuy";
       await ctx.reply(
-        "5️⃣ Send <b>minimum $ buy</b> that will trigger an alert (e.g. 50).",
+        "🖼 Image URL saved!\n\n5️⃣ Send <b>minimum $ buy</b> that will trigger an alert (e.g. 50).",
         { parse_mode: "HTML" }
       );
       return null;
@@ -455,6 +517,8 @@ async function runSetupStep(
         allPairAddresses: allPairs,
         emoji: state.settings.emoji || "🟢",
         imageUrl: state.settings.imageUrl,
+        imageFileId: (state.settings as any).imageFileId,
+        animationFileId: (state.settings as any).animationFileId,
         minBuyUsd: state.settings.minBuyUsd ?? 0,
         maxBuyUsd: state.settings.maxBuyUsd,
         dollarsPerEmoji: state.settings.dollarsPerEmoji ?? 50,
@@ -470,7 +534,8 @@ async function runSetupStep(
   return null;
 }
 
-// sort by liquidity.usd desc
+// ---------- helpers ----------
+
 function sortPairsByLiquidity(pairs: DexPair[]): DexPair[] {
   return [...pairs].sort((a, b) => {
     const la = Number(a?.liquidity?.usd ?? 0);
@@ -484,7 +549,42 @@ function shorten(addr: string, len = 6): string {
   return addr.slice(0, len) + "..." + addr.slice(-len);
 }
 
-// Small helper: nice help text in group
+async function sendVisualAlert(ctx: Context, settings: BuyBotSettings, text: string) {
+  // priority: animation > uploaded photo > url(gif) > url(image) > plain text
+  if (settings.animationFileId) {
+    await (ctx as any).replyWithAnimation(settings.animationFileId, {
+      caption: text,
+      parse_mode: "HTML"
+    });
+    return;
+  }
+
+  if (settings.imageFileId) {
+    await (ctx as any).replyWithPhoto(settings.imageFileId, {
+      caption: text,
+      parse_mode: "HTML"
+    });
+    return;
+  }
+
+  if (settings.imageUrl) {
+    if (settings.imageUrl.toLowerCase().endsWith(".gif")) {
+      await (ctx as any).replyWithAnimation(settings.imageUrl, {
+        caption: text,
+        parse_mode: "HTML"
+      });
+    } else {
+      await (ctx as any).replyWithPhoto(settings.imageUrl, {
+        caption: text,
+        parse_mode: "HTML"
+      });
+    }
+    return;
+  }
+
+  await ctx.reply(text, { parse_mode: "HTML" });
+}
+
 async function sendGroupHelp(ctx: Context) {
   await ctx.reply(
     "🕵️ <b>Premium Buy Bot</b>\n\n" +
@@ -493,7 +593,7 @@ async function sendGroupHelp(ctx: Context) {
       "Flow:\n" +
       "1) Run <code>/add</code>\n" +
       "2) Choose <b>Set up in DM</b> or <b>Set up here</b>\n" +
-      "3) Token → all pools → emoji → GIF → min/max buy → $ per emoji → group link.\n",
+      "3) Token → all pools → emoji → GIF / image → min/max buy → $ per emoji → group link.\n",
     { parse_mode: "HTML" }
   );
 }

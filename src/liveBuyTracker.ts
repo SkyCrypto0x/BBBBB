@@ -23,20 +23,29 @@ interface ChainRuntime {
 // chainId -> runtime
 const runtimes = new Map<ChainId, ChainRuntime>();
 
-// public API from this file
 export function startLiveBuyTracker(bot: Telegraf) {
-  // every 15s we scan settings and ensure listeners attached
+  // first run immediately
+  syncListeners(bot).catch((e) =>
+    console.error("initial syncListeners error", e)
+  );
+
+  // then every 15s resync
   setInterval(() => {
     syncListeners(bot).catch((e) => console.error("syncListeners error", e));
   }, 15000);
 }
 
 async function syncListeners(bot: Telegraf) {
-  // loop all configured groups
-  for (const [, settings] of groupSettings.entries()) {
+  console.log("🔁 Syncing live listeners…");
+
+  for (const [groupId, settings] of groupSettings.entries()) {
     const chain = settings.chain;
     const chainCfg = appConfig.chains[chain];
     if (!chainCfg) continue;
+
+    console.log(
+      `  • group ${groupId} on chain ${chain}, pairs: ${settings.allPairAddresses.length}`
+    );
 
     let runtime = runtimes.get(chain);
     if (!runtime) {
@@ -127,7 +136,6 @@ function handleSwap(
   }
   if (!relatedGroups.length) return;
 
-  // For now assume all groups share the same tokenAddress for this pair
   const settings = relatedGroups[0][1];
   const tokenAddr = settings.tokenAddress.toLowerCase();
 
@@ -135,8 +143,6 @@ function handleSwap(
   const isToken1 = pairTokens.token1 === tokenAddr;
   if (!isToken0 && !isToken1) return; // safety
 
-  // UniswapV2/PancakeV2 convention:
-  // - "buy" of our token = tokenOut > 0 and other asset In > 0
   let rawTokenOut: ethers.BigNumber;
   let rawBaseIn: ethers.BigNumber;
 
@@ -153,15 +159,14 @@ function handleSwap(
     return;
   }
 
-  // Approximate decimals as 18 (most BSC tokens & WBNB)
-  const tokenAmount = parseFloat(
-    ethers.utils.formatUnits(rawTokenOut, 18)
-  );
-  const baseAmount = parseFloat(
-    ethers.utils.formatUnits(rawBaseIn, 18)
+  // Approx decimal 18 (most ERC20/WBNB)
+  const tokenAmount = parseFloat(ethers.utils.formatUnits(rawTokenOut, 18));
+  const baseAmount = parseFloat(ethers.utils.formatUnits(rawBaseIn, 18));
+
+  console.log(
+    `💹 Buy on pair ${pairAddress}, tx ${txHash}, tokenAmount=${tokenAmount}, baseIn=${baseAmount}`
   );
 
-  // send alert to all related groups
   for (const [groupId, s] of relatedGroups) {
     sendBuyAlert(bot, groupId, s, tokenAmount, baseAmount, txHash);
   }
@@ -175,31 +180,76 @@ function sendBuyAlert(
   baseAmount: number,
   txHash: string
 ) {
-  // simple min/max filter using baseAmount as proxy (BNB spent)
   const min = settings.minBuyUsd ?? 0;
   const max = settings.maxBuyUsd;
 
+  // এখানে baseAmount কে "size" হিসেবে ধরি (e.g. BNB amount)
   if (min && baseAmount < min) return;
   if (max && baseAmount > max) return;
 
-  // emojis based on "size" – here token amount approx
   const per = settings.dollarsPerEmoji || 1;
   const emojiCount = Math.min(
     30,
-    Math.max(1, Math.round(tokenAmount / per))
+    Math.max(1, Math.round(baseAmount / per))
   );
   const emojiBar = settings.emoji.repeat(emojiCount || 1);
 
   const explorer = appConfig.chains[settings.chain]?.explorer ?? "";
   const txUrl = explorer ? `${explorer}/tx/${txHash}` : txHash;
+  const mainPairUrl = `https://dexscreener.com/${settings.chain}/${settings.pairAddress}`;
 
   const text =
-    "🧠 <b>Live Buy Detected</b>\n\n" +
+    "🧠 <b>Premium Buy Alert</b>\n\n" +
+    `<b>${baseAmount.toFixed(4)} BUY</b>\n` +
     `${emojiBar}\n\n` +
     `🪙 <b>Token:</b> <code>${shorten(settings.tokenAddress)}</code>\n` +
-    `💰 <b>Token amount:</b> ${tokenAmount.toFixed(4)}\n` +
-    `🟡 <b>Base spent:</b> ${baseAmount.toFixed(4)} (e.g. BNB)\n` +
-    `🔗 <a href="${txUrl}">View on ${explorer || "explorer"}</a>`;
+    `🧬 <b>Main pair:</b> <code>${shorten(settings.pairAddress)}</code>\n` +
+    (settings.allPairAddresses.length > 1
+      ? `🌊 <b>Total pools:</b> ${settings.allPairAddresses.length}\n`
+      : "") +
+    `📊 <a href="${mainPairUrl}">DexScreener chart</a>\n` +
+    (explorer ? `🔗 <a href="${txUrl}">BscScan tx</a>` : "");
+
+  // visuals same priority order as /testbuy
+  if (settings.animationFileId) {
+    bot.telegram
+      .sendAnimation(groupId, settings.animationFileId, {
+        caption: text,
+        parse_mode: "HTML"
+      })
+      .catch((e) => console.error("sendAnimation error", e));
+    return;
+  }
+
+  if (settings.imageFileId) {
+    bot.telegram
+      .sendPhoto(groupId, settings.imageFileId, {
+        caption: text,
+        parse_mode: "HTML"
+      })
+      .catch((e) => console.error("sendPhoto error", e));
+    return;
+  }
+
+  if (settings.imageUrl) {
+    const lower = settings.imageUrl.toLowerCase();
+    if (lower.endsWith(".gif")) {
+      bot.telegram
+        .sendAnimation(groupId, settings.imageUrl, {
+          caption: text,
+          parse_mode: "HTML"
+        })
+        .catch((e) => console.error("sendAnimation error", e));
+    } else {
+      bot.telegram
+        .sendPhoto(groupId, settings.imageUrl, {
+          caption: text,
+          parse_mode: "HTML"
+        })
+        .catch((e) => console.error("sendPhoto error", e));
+    }
+    return;
+  }
 
   bot.telegram
     .sendMessage(groupId, text, { parse_mode: "HTML" })
