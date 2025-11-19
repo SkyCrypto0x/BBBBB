@@ -32,23 +32,28 @@ export interface DexPair {
 }
 
 // 🔍 Get *all* pools for a token on a chain
-// API: GET https://api.dexscreener.com/token-pairs/v1/{chainId}/{tokenAddress}
-export async function fetchTokenPairs(
-  chain: ChainId,
-  tokenAddress: string
-): Promise<DexPair[]> {
+// API: GET https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}
+
+// Ei function ta pura replace kor
+export async function fetchTokenPairs(chain: ChainId, tokenAddress: string): Promise<DexPair[]> {
   try {
-    const url = `https://api.dexscreener.com/token-pairs/v1/${chain}/${tokenAddress}`;
+    // NEW WORKING API (2025)
+    const url = `https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`;
     const res = await fetch(url);
-    if (!res.ok) {
-      console.error("DexScreener error status:", res.status);
-      return [];
-    }
-    const data: any = await res.json();
-    if (!Array.isArray(data)) return [];
-    return data as DexPair[];
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data.pairs || !Array.isArray(data.pairs)) return [];
+
+    return data.pairs
+      .filter((p: any) => p.chainId === chain)
+      .map((p: any) => ({
+        chainId: p.chainId,
+        dexId: p.dexId,
+        pairAddress: p.pairAddress,
+        liquidity: { usd: p.liquidity?.usd },
+      }));
   } catch (e) {
-    console.error("fetchTokenPairs error:", e);
+    console.error("DexScreener fetch error:", e);
     return [];
   }
 }

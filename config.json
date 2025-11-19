@@ -6,11 +6,11 @@
 
   "chains": {
     "bsc": {
-      "rpcUrl": "wss://proportionate-falling-morning.bsc.quiknode.pro/ef340006d869e9351618f50a21e0651af780c88a",
+      "rpcUrl": "wss://old-palpable-choice.bsc.quiknode.pro/1b9062cadf4275a08693a6800c7edbf222c95f82/",
       "explorer": "https://bscscan.com"
     },
     "ethereum": {
-      "rpcUrl": "https://rpc.ankr.com/eth",
+      "rpcUrl": "wss://proportionate-falling-morning.quiknode.pro/ef340006d869e9351618f50a21e0651af780c88a",
       "explorer": "https://etherscan.io"
     }
   }
