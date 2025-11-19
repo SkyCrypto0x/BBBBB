@@ -585,6 +585,7 @@ async function sendVisualAlert(ctx: Context, settings: BuyBotSettings, text: str
   await ctx.reply(text, { parse_mode: "HTML" });
 }
 
+
 async function sendGroupHelp(ctx: Context) {
   await ctx.reply(
     "🕵️ <b>Premium Buy Bot</b>\n\n" +

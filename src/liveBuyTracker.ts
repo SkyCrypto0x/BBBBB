@@ -2,6 +2,7 @@ import { Telegraf } from "telegraf";
 import { ethers } from "ethers";
 import { appConfig, ChainId } from "./rpcAndApi";
 import { groupSettings, BuyBotSettings } from "./feature.buyBot";
+import fetch from "node-fetch";
 
 const PAIR_ABI = [
   "function token0() view returns (address)",
@@ -17,246 +18,189 @@ interface PairRuntime {
 
 interface ChainRuntime {
   provider: ethers.providers.Provider;
-  pairs: Map<string, PairRuntime>; // pairAddress -> runtime
+  pairs: Map<string, PairRuntime>;
 }
 
-// chainId -> runtime
 const runtimes = new Map<ChainId, ChainRuntime>();
 
 export function startLiveBuyTracker(bot: Telegraf) {
-  // first run immediately
-  syncListeners(bot).catch((e) =>
-    console.error("initial syncListeners error", e)
-  );
-
-  // then every 15s resync
-  setInterval(() => {
-    syncListeners(bot).catch((e) => console.error("syncListeners error", e));
-  }, 15000);
+  syncListeners(bot).catch((e) => console.error("Initial sync error:", e));
+  setInterval(() => syncListeners(bot).catch((e) => console.error("Sync error:", e)), 15_000);
 }
 
 async function syncListeners(bot: Telegraf) {
-  console.log("🔁 Syncing live listeners…");
+  console.log("🔁 Syncing live listeners...");
 
   for (const [groupId, settings] of groupSettings.entries()) {
     const chain = settings.chain;
     const chainCfg = appConfig.chains[chain];
     if (!chainCfg) continue;
 
-    console.log(
-      `  • group ${groupId} on chain ${chain}, pairs: ${settings.allPairAddresses.length}`
-    );
-
     let runtime = runtimes.get(chain);
     if (!runtime) {
-      const rpc = chainCfg.rpcUrl;
+      const provider = chainCfg.rpcUrl.startsWith("wss")
+        ? new ethers.providers.WebSocketProvider(chainCfg.rpcUrl)
+        : new ethers.providers.JsonRpcProvider(chainCfg.rpcUrl);
 
-      const provider = rpc.startsWith("wss")
-        ? new ethers.providers.WebSocketProvider(rpc)
-        : new ethers.providers.JsonRpcProvider(rpc);
-
-      runtime = {
-        provider,
-        pairs: new Map()
-      };
+      runtime = { provider, pairs: new Map() };
       runtimes.set(chain, runtime);
-
-      console.log(`🔗 Live tracker: connected to ${chain} RPC`);
+      console.log(`🔗 Connected to ${chain} RPC`);
     }
 
-    // ensure every pair has a listener
-    for (const pair of settings.allPairAddresses) {
-      const addr = pair.toLowerCase();
+    for (const pairAddr of settings.allPairAddresses) {
+      const addr = pairAddr.toLowerCase();
       if (runtime.pairs.has(addr)) continue;
 
       try {
         const contract = new ethers.Contract(addr, PAIR_ABI, runtime.provider);
-        const token0 = (await contract.token0()).toLowerCase();
-        const token1 = (await contract.token1()).toLowerCase();
+        const [token0, token1] = await Promise.all([contract.token0(), contract.token1()]);
 
-        runtime.pairs.set(addr, { contract, token0, token1 });
+        const t0 = token0.toLowerCase();
+        const t1 = token1.toLowerCase();
 
-        console.log(
-          `🛰️ Listening Swap events on ${chain} pair ${addr} (token0=${token0}, token1=${token1})`
-        );
+        runtime.pairs.set(addr, { contract, token0: t0, token1: t1 });
 
-        contract.on(
-          "Swap",
-          (
-            sender,
+        console.log(`🛰️ Listening on pair ${addr.substring(0, 10)}...`);
+
+        contract.on("Swap", (sender, amount0In, amount1In, amount0Out, amount1Out, to, event) => {
+          handleSwap(
+            bot,
+            chain,
+            addr,
+            { token0: t0, token1: t1 },
+            event.transactionHash,
             amount0In,
             amount1In,
             amount0Out,
-            amount1Out,
-            to,
-            event
-          ) => {
-            handleSwap(
-              bot,
-              chain,
-              addr,
-              { token0, token1 },
-              event.transactionHash,
-              amount0In,
-              amount1In,
-              amount0Out,
-              amount1Out
-            );
-          }
-        );
+            amount1Out
+          );
+        });
       } catch (e) {
-        console.error("Error attaching listener to pair", addr, e);
+        console.error(`Failed to attach listener to pair ${addr}`, e);
       }
     }
   }
 }
 
-function handleSwap(
+async function handleSwap(
   bot: Telegraf,
   chain: ChainId,
   pairAddress: string,
-  pairTokens: { token0: string; token1: string },
+  tokens: { token0: string; token1: string },
   txHash: string,
   amount0In: ethers.BigNumber,
   amount1In: ethers.BigNumber,
   amount0Out: ethers.BigNumber,
   amount1Out: ethers.BigNumber
 ) {
-  // find all groups that use this pair on this chain
-  const relatedGroups: Array<[number, BuyBotSettings]> = [];
+  const relatedGroups: [number, BuyBotSettings][] = [];
+
   for (const [groupId, settings] of groupSettings.entries()) {
-    if (
-      settings.chain === chain &&
-      settings.allPairAddresses
-        .map((p) => p.toLowerCase())
-        .includes(pairAddress)
-    ) {
+    if (settings.chain === chain && settings.allPairAddresses.some(p => p.toLowerCase() === pairAddress)) {
       relatedGroups.push([groupId, settings]);
     }
   }
-  if (!relatedGroups.length) return;
+  if (relatedGroups.length === 0) return;
 
   const settings = relatedGroups[0][1];
-  const tokenAddr = settings.tokenAddress.toLowerCase();
+  const targetToken = settings.tokenAddress.toLowerCase();
 
-  const isToken0 = pairTokens.token0 === tokenAddr;
-  const isToken1 = pairTokens.token1 === tokenAddr;
-  if (!isToken0 && !isToken1) return; // safety
+  const isToken0 = tokens.token0 === targetToken;
+  const isToken1 = tokens.token1 === targetToken;
+  if (!isToken0 && !isToken1) return;
 
-  let rawTokenOut: ethers.BigNumber;
-  let rawBaseIn: ethers.BigNumber;
+  const baseIn = isToken0 ? amount1In : amount0In;
+  const tokenOut = isToken0 ? amount0Out : amount1Out;
 
-  if (isToken0) {
-    rawTokenOut = amount0Out;
-    rawBaseIn = amount1In;
-  } else {
-    rawTokenOut = amount1Out;
-    rawBaseIn = amount0In;
+  if (baseIn.lte(0) || tokenOut.lte(0)) return; // not a buy
+
+  const baseAmount = parseFloat(ethers.utils.formatUnits(baseIn, 18));
+
+  // Get real-time USD price from DexScreener
+  let usdValue = baseAmount * (chain === "bsc" ? 600 : 3000); // fallback
+  try {
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/pairs/${chain}/${settings.pairAddress}`);
+    if (res.ok) {
+      const data: any = await res.json();
+      if (data?.pair?.priceUsd && data?.pair?.priceNative) {
+        const nativePriceUsd = data.pair.priceUsd / parseFloat(data.pair.priceNative);
+        usdValue = baseAmount * nativePriceUsd;
+      }
+    }
+  } catch (e) {
+    console.error("DexScreener price fetch failed, using fallback");
   }
-
-  if (rawTokenOut.lte(0)) {
-    // probably a sell; ignore (later we can add sell alerts)
-    return;
-  }
-
-  // Approx decimal 18 (most ERC20/WBNB)
-  const tokenAmount = parseFloat(ethers.utils.formatUnits(rawTokenOut, 18));
-  const baseAmount = parseFloat(ethers.utils.formatUnits(rawBaseIn, 18));
-
-  console.log(
-    `💹 Buy on pair ${pairAddress}, tx ${txHash}, tokenAmount=${tokenAmount}, baseIn=${baseAmount}`
-  );
 
   for (const [groupId, s] of relatedGroups) {
-    sendBuyAlert(bot, groupId, s, tokenAmount, baseAmount, txHash);
+    sendPremiumBuyAlert(bot, groupId, s, usdValue, baseAmount, txHash, chain);
   }
 }
 
-function sendBuyAlert(
+async function sendPremiumBuyAlert(
   bot: Telegraf,
   groupId: number,
   settings: BuyBotSettings,
-  tokenAmount: number,
+  usdValue: number,
   baseAmount: number,
-  txHash: string
+  txHash: string,
+  chain: ChainId
 ) {
-  const min = settings.minBuyUsd ?? 0;
-  const max = settings.maxBuyUsd;
+  const buyUsd = Number(usdValue.toFixed(2));
+  if (buyUsd < settings.minBuyUsd) return;
+  if (settings.maxBuyUsd && buyUsd > settings.maxBuyUsd) return;
 
-  // এখানে baseAmount কে "size" হিসেবে ধরি (e.g. BNB amount)
-  if (min && baseAmount < min) return;
-  if (max && baseAmount > max) return;
+  const emojiCount = Math.min(30, Math.max(1, Math.floor(buyUsd / settings.dollarsPerEmoji)));
+  const emojiBar = settings.emoji.repeat(emojiCount);
 
-  const per = settings.dollarsPerEmoji || 1;
-  const emojiCount = Math.min(
-    30,
-    Math.max(1, Math.round(baseAmount / per))
-  );
-  const emojiBar = settings.emoji.repeat(emojiCount || 1);
+  const explorerUrl = `${appConfig.chains[chain].explorer}/tx/${txHash}`;
+  const dexUrl = `https://dexscreener.com/${chain}/${settings.pairAddress}`;
+  const baseSymbol = chain === "bsc" ? "BNB" : "ETH";
 
-  const explorer = appConfig.chains[settings.chain]?.explorer ?? "";
-  const txUrl = explorer ? `${explorer}/tx/${txHash}` : txHash;
-  const mainPairUrl = `https://dexscreener.com/${settings.chain}/${settings.pairAddress}`;
+  const message = `
+🚀 <b>BUY DETECTED!</b> 🚀
 
-  const text =
-    "🧠 <b>Premium Buy Alert</b>\n\n" +
-    `<b>${baseAmount.toFixed(4)} BUY</b>\n` +
-    `${emojiBar}\n\n` +
-    `🪙 <b>Token:</b> <code>${shorten(settings.tokenAddress)}</code>\n` +
-    `🧬 <b>Main pair:</b> <code>${shorten(settings.pairAddress)}</code>\n` +
-    (settings.allPairAddresses.length > 1
-      ? `🌊 <b>Total pools:</b> ${settings.allPairAddresses.length}\n`
-      : "") +
-    `📊 <a href="${mainPairUrl}">DexScreener chart</a>\n` +
-    (explorer ? `🔗 <a href="${txUrl}">BscScan tx</a>` : "");
+<b>$${buyUsd.toLocaleString("en-US")} BUY</b>
+${emojiBar}
 
-  // visuals same priority order as /testbuy
-  if (settings.animationFileId) {
-    bot.telegram
-      .sendAnimation(groupId, settings.animationFileId, {
-        caption: text,
-        parse_mode: "HTML"
-      })
-      .catch((e) => console.error("sendAnimation error", e));
-    return;
-  }
+🪙 <b>Token:</b> <code>${shorten(settings.tokenAddress)}</code>
+💰 <b>Amount:</b> ${baseAmount.toFixed(4)} ${baseSymbol}
+🔗 <a href="${explorerUrl}">View Transaction</a>
+📊 <a href="${dexUrl}">DexScreener Chart</a>
+${settings.tgGroupLink ? `\n👥 <a href="${settings.tgGroupLink}">Join Community</a>` : ""}
+  `.trim();
 
-  if (settings.imageFileId) {
-    bot.telegram
-      .sendPhoto(groupId, settings.imageFileId, {
-        caption: text,
-        parse_mode: "HTML"
-      })
-      .catch((e) => console.error("sendPhoto error", e));
-    return;
-  }
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: "🔗 Transaction", url: explorerUrl }],
+      [{ text: "📊 DexScreener", url: dexUrl }],
+      settings.tgGroupLink ? [{ text: "👥 Join Community", url: settings.tgGroupLink }] : []
+    ].filter(row => row.length > 0)
+  };
 
-  if (settings.imageUrl) {
-    const lower = settings.imageUrl.toLowerCase();
-    if (lower.endsWith(".gif")) {
-      bot.telegram
-        .sendAnimation(groupId, settings.imageUrl, {
-          caption: text,
-          parse_mode: "HTML"
-        })
-        .catch((e) => console.error("sendAnimation error", e));
+  try {
+    if (settings.animationFileId) {
+      await bot.telegram.sendAnimation(groupId, settings.animationFileId, { caption: message, parse_mode: "HTML", reply_markup: keyboard } as any);
+    } else if (settings.imageFileId) {
+      await bot.telegram.sendPhoto(groupId, settings.imageFileId, { caption: message, parse_mode: "HTML", reply_markup: keyboard } as any);
+    } else if (settings.imageUrl) {
+      const isGif = settings.imageUrl.toLowerCase().endsWith(".gif");
+      if (isGif) {
+        await bot.telegram.sendAnimation(groupId, settings.imageUrl, { caption: message, parse_mode: "HTML", reply_markup: keyboard } as any);
+      } else {
+        await bot.telegram.sendPhoto(groupId, settings.imageUrl, { caption: message, parse_mode: "HTML", reply_markup: keyboard } as any);
+      }
     } else {
-      bot.telegram
-        .sendPhoto(groupId, settings.imageUrl, {
-          caption: text,
-          parse_mode: "HTML"
-        })
-        .catch((e) => console.error("sendPhoto error", e));
+      await bot.telegram.sendMessage(groupId, message, {
+        parse_mode: "HTML",
+        reply_markup: keyboard
+      } as any);
     }
-    return;
+    console.log(`✅ Alert sent → $${buyUsd} to group ${groupId}`);
+  } catch (err: any) {
+    console.error(`Send failed to ${groupId}:`, err.message);
   }
-
-  bot.telegram
-    .sendMessage(groupId, text, { parse_mode: "HTML" })
-    .catch((e) => console.error("sendMessage error", e));
 }
 
 function shorten(addr: string, len = 6): string {
-  if (!addr || addr.length <= len * 2) return addr;
-  return addr.slice(0, len) + "..." + addr.slice(-len);
+  return addr ? `${addr.slice(0, len)}...${addr.slice(-len + 2)}` : "";
 }
