@@ -33,7 +33,7 @@ interface PremiumAlertData {
   buyer: string;
   positionIncrease: number | null;
   marketCap: number;
-  volume5m: number;
+  volume24h: number;
   priceUsd: number;
 }
 
@@ -156,32 +156,50 @@ async function handleSwap(
 
   const baseAmount = parseFloat(ethers.utils.formatUnits(baseIn, 18));
 
-  // ---- DexScreener data: price, MC, 5m volume, token symbol ----
-  let priceNative = 0;
+  // ---- Real 24h Volume + MC + Price (2025 fix) ----
   let priceUsd = 0;
   let marketCap = 0;
-  let volume5m = 0;
-  let tokenDecimals = 18;
+  let volume24h = 0;
   let tokenSymbol = "TOKEN";
+  let tokenDecimals = 18;
 
   try {
     const res = await fetch(
-      `https://api.dexscreener.com/latest/dex/pairs/${chain}/${pairAddress}`
+      `https://api.dexscreener.com/latest/dex/pairs/${chain}/${settings.pairAddress}`
     );
     const data: any = await res.json();
+
     if (data?.pair) {
-      priceUsd = parseFloat(data.pair.priceUsd || "0");
-      priceNative = parseFloat(data.pair.priceNative || "0");
-      marketCap = data.pair.fdv || 0;
-      // 24h volume থেকে আনুমানিক 5m volume (24h = 24*60 মিনিট, প্রতি 5 মিনিটে 24*12 slot)
-      volume5m = data.pair.volume?.h24
-        ? data.pair.volume.h24 / (24 * 12)
-        : data.pair.volume?.m5 || 0;
-      tokenSymbol = data.pair.baseToken?.symbol || "TOKEN";
-      tokenDecimals = data.pair.baseToken?.decimals || 18;
+      const p = data.pair;
+
+      if (
+        p.baseToken?.address.toLowerCase() ===
+        settings.tokenAddress.toLowerCase()
+      ) {
+        priceUsd = parseFloat(p.priceUsd || "0");
+        tokenSymbol = p.baseToken.symbol || "TOKEN";
+        tokenDecimals = p.baseToken.decimals || 18;
+      } else if (
+        p.quoteToken?.address.toLowerCase() ===
+        settings.tokenAddress.toLowerCase()
+      ) {
+        const raw = parseFloat(p.priceUsd || "0");
+        priceUsd = raw ? 1 / raw : 0;
+        tokenSymbol = p.quoteToken.symbol || "TOKEN";
+        tokenDecimals = p.quoteToken.decimals || 18;
+      }
+
+      marketCap = p.fdv || 0;
+      volume24h = p.volume?.h24 || 0;
     }
   } catch (e) {
-    console.error("DexScreener pair fetch failed:", e);
+    console.error("DexScreener fetch failed:", e);
+  }
+
+  // fallback MC (very rough)
+  if (marketCap === 0 && priceUsd > 0) {
+    const totalSupply = 1_000_000_000_000_000; // assume 1T supply memes
+    marketCap = priceUsd * totalSupply;
   }
 
   // Native token price (BNB / ETH) from Binance
@@ -192,12 +210,13 @@ async function handleSwap(
 
   const usdValue = baseAmount * nativePriceUsd;
 
-  // ✅ token amount from on-chain amount + decimals
-  let tokenAmount = 0;
-  tokenAmount = parseFloat(ethers.utils.formatUnits(tokenOut, tokenDecimals));
+  // token amount from on-chain amount + decimals
+  const tokenAmount = parseFloat(
+    ethers.utils.formatUnits(tokenOut, tokenDecimals)
+  );
 
   // Position increase based on previous balance
-  const buyer = ethers.utils.getAddress(to); // checksum address
+  const buyer = ethers.utils.getAddress(to); // checksum
   const prevBalance = await getPreviousBalance(
     chain,
     settings.tokenAddress,
@@ -209,8 +228,8 @@ async function handleSwap(
   let positionIncrease: number | null = null;
   if (prevBalance > 0n) {
     const diff = currentBalance - prevBalance;
-    const increase = Number((diff * 1000n) / prevBalance) / 10; // one decimal
-    positionIncrease = Math.round(increase); // e.g. 123.4 -> 123
+    const increase = Number((diff * 1000n) / prevBalance) / 10; // 1 decimal
+    positionIncrease = Math.round(increase);
   }
 
   for (const [groupId, s] of relatedGroups) {
@@ -224,7 +243,7 @@ async function handleSwap(
       buyer,
       positionIncrease,
       marketCap,
-      volume5m,
+      volume24h,
       priceUsd
     };
 
@@ -248,17 +267,12 @@ async function sendPremiumBuyAlert(
     buyer,
     positionIncrease,
     marketCap,
-    volume5m
+    volume24h
   } = data;
 
   const buyUsd = Math.round(usdValue);
   if (buyUsd < settings.minBuyUsd) return;
   if (settings.maxBuyUsd && buyUsd > settings.maxBuyUsd) return;
-
-  const emojiCount = Math.floor(
-    buyUsd / (settings.dollarsPerEmoji || 50)
-  );
-  const emojiBar = settings.emoji.repeat(Math.min(50, emojiCount));
 
   const chainStr = String(chain).toLowerCase();
   const baseSymbol =
@@ -277,29 +291,43 @@ async function sendPremiumBuyAlert(
   const txUrl = `${explorerBase}/tx/${txHash}`;
   const addrUrl = `${explorerBase}/address/${buyer}`;
 
-  const mcText = marketCap > 0 ? (marketCap / 1e6).toFixed(2) : "0.00";
-  const vol5Text =
-    volume5m > 0 ? (volume5m / 1e3).toFixed(0) : "0";
+  // Emoji bar
+  const emojiCount = Math.floor(
+    buyUsd / (settings.dollarsPerEmoji || 50)
+  );
+  const emojiBar = settings.emoji.repeat(
+    Math.min(50, emojiCount)
+  );
+
+  const mcText = marketCap > 0 ? (marketCap / 1_000_000).toFixed(2) : "0.00";
 
   const whaleLoadLine =
     positionIncrease !== null && positionIncrease > 500
-      ? "🚀 <b>WHALE LOADING HEAVILY!</b>\n"
+      ? "🚀🚀 <b>WHALE LOADING HEAVILY!</b> 🚀🚀\n"
       : "";
 
-  const whaleOrNewBuyLine =
-    buyUsd > 10_000
-      ? "🐳 <b>WHALE ALERT!!!</b>"
-      : "🟢 <b>New Buy</b>";
+  const volumeLine = `🔥 Volume (24h): $${volume24h >= 1_000_000
+    ? (volume24h / 1_000_000).toFixed(1) + "M"
+    : (volume24h / 1_000).toFixed(0) + "K"}`;
+
+  // একটাই header – এখানে আর আলাদা New Buy লাইন নেই
+  const headerLine =
+    buyUsd >= 5000
+      ? "🐳🐳 <b>WHALE INCOMING!!!</b> 🐳🐳"
+      : buyUsd >= 3000
+      ? "🚨 <b>BIG BUY DETECTED!</b> 🚨"
+      : buyUsd >= 1000
+      ? "🟢🟢🟢 <b>Strong Buy</b> 🟢🟢🟢"
+      : "🟢 <b>New Buy</b> 🟢";
 
   const message = `
-🚨 <b>BIG BUY DETECTED!</b> 🚨
-${whaleLoadLine}${whaleOrNewBuyLine}
-
+${headerLine}
+${whaleLoadLine}
 💰 <b>$${buyUsd.toLocaleString()}</b> ${tokenSymbol} BUY
 ${emojiBar}
 
-🟢 ${baseSymbol}: ${baseAmount.toFixed(4)} ($${buyUsd.toLocaleString()})
-🪙 ${tokenSymbol}: ${Math.round(tokenAmount)
+🔸 ${baseSymbol}: ${baseAmount.toFixed(4)} ($${buyUsd.toLocaleString()})
+💳 ${tokenSymbol}: ${Math.round(tokenAmount)
     .toString()
     .replace(/\B(?=(\d{3})+(?!\d))/g, ",")}
 
@@ -310,7 +338,7 @@ ${
     ? `🧠 <b>Position Increased: +${positionIncrease.toFixed(0)}%</b>\n`
     : ""
 }📊 MC: $${mcText}M
-🔥 Vol (est. 5m): $${vol5Text}K
+${volumeLine}
   `.trim();
 
   const dexScreenerUrl = `https://dexscreener.com/${chain}/${settings.pairAddress}`;
@@ -321,16 +349,16 @@ ${
   const keyboard: any = {
     inline_keyboard: [
       [
-        { text: "📊 DexScreener", url: dexScreenerUrl },
+        { text: "🦅 DexScreener", url: dexScreenerUrl },
         { text: "📈 DexTools", url: dexToolsUrl }
       ],
       settings.tgGroupLink
-        ? [{ text: "👥 Join Alpha Group", url: settings.tgGroupLink }]
+        ? [{ text: "👥 Join Token Group", url: settings.tgGroupLink }]
         : [],
       [
         {
           text: "✉️ DM for Access",
-          url: "https://t.me/yourusername" // এখানে নিজের username বসাও
+          url: "https://t.me/yourusername" // নিজের username দে
         }
       ]
     ].filter((row: any[]) => row.length > 0)
