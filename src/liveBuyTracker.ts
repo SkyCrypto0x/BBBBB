@@ -35,6 +35,8 @@ interface PremiumAlertData {
   marketCap: number;
   volume24h: number;
   priceUsd: number;
+  pairAddress: string;
+  pairLiquidityUsd: number;
 }
 
 export function startLiveBuyTracker(bot: Telegraf) {
@@ -53,6 +55,17 @@ async function syncListeners(bot: Telegraf) {
     const chainCfg = appConfig.chains[chain];
     if (!chainCfg) continue;
 
+    // settings.allPairAddresses empty হলে auto-fill কর
+    if (!settings.allPairAddresses || settings.allPairAddresses.length === 0) {
+      const validPairs = await getAllValidPairs(settings.tokenAddress, chain);
+      if (validPairs.length > 0) {
+        settings.allPairAddresses = validPairs.map((p) => p.address);
+        console.log(
+          `Auto-added ${validPairs.length} pools for ${settings.tokenAddress}`
+        );
+      }
+    }
+
     let runtime = runtimes.get(chain);
     if (!runtime) {
       const provider = chainCfg.rpcUrl.startsWith("wss")
@@ -64,16 +77,74 @@ async function syncListeners(bot: Telegraf) {
       console.log(`🔗 Connected to ${chain} RPC`);
     }
 
+    if (!settings.allPairAddresses || settings.allPairAddresses.length === 0) {
+      // still nothing → skip this group
+      continue;
+    }
+
     for (const pairAddr of settings.allPairAddresses) {
       const addr = pairAddr.toLowerCase();
+
+      // Pair address check — shudhu real DEX pair e listener lagbe
+      const isValidPair =
+        addr === settings.pairAddress.toLowerCase() ||
+        settings.allPairAddresses.map((a) => a.toLowerCase()).includes(addr);
+
+      if (!isValidPair) {
+        console.log(`Skipping unrelated pair ${addr} for group ${groupId}`);
+        continue;
+      }
+
       if (runtime.pairs.has(addr)) continue;
 
       try {
         const contract = new ethers.Contract(addr, PAIR_ABI, runtime.provider);
-        const [token0, token1] = await Promise.all([
-          contract.token0(),
-          contract.token1()
-        ]);
+
+        // token0/token1 call er age try-catch (improved logging + Ethereum retry)
+        let token0: string;
+        let token1: string;
+
+        try {
+          [token0, token1] = await Promise.all([
+            contract.token0(),
+            contract.token1()
+          ]);
+        } catch (e: any) {
+          console.log(
+            `❌ Skipping non-standard pair ${addr} on ${chain}: ${
+              e?.message || e
+            }`
+          );
+
+          // Optional: Ethereum e ekbar retry (rate limit / transient RPC error handle করার জন্য)
+          if (chain === "ethereum") {
+            console.log(`🔄 Retrying token0/token1 for ${addr}...`);
+            try {
+              const retryToken0 = await contract.token0().catch(() => null);
+              const retryToken1 = await contract.token1().catch(() => null);
+
+              if (retryToken0 && retryToken1) {
+                [token0, token1] = [retryToken0, retryToken1];
+                console.log(`✅ Retry success for ${addr}`);
+              } else {
+                console.log(
+                  `❌ Retry still missing token0/token1 for ${addr} (token0=${retryToken0}, token1=${retryToken1})`
+                );
+                continue;
+              }
+            } catch (retryErr: any) {
+              console.log(
+                `❌ Retry failed for ${addr}: ${
+                  retryErr?.message || retryErr
+                }`
+              );
+              continue;
+            }
+          } else {
+            // onno chain-e eibar skip kore dao
+            continue;
+          }
+        }
 
         const t0 = token0.toLowerCase();
         const t1 = token1.toLowerCase();
@@ -133,7 +204,7 @@ async function handleSwap(
   for (const [groupId, settings] of groupSettings.entries()) {
     if (
       settings.chain === chain &&
-      settings.allPairAddresses.some(
+      settings.allPairAddresses?.some(
         (p) => p.toLowerCase() === pairAddress.toLowerCase()
       )
     ) {
@@ -143,6 +214,18 @@ async function handleSwap(
   if (relatedGroups.length === 0) return;
 
   const settings = relatedGroups[0][1];
+
+  // groupSettings er moddhe allPairAddresses already ache? na thakle fetch kore fill kor
+  if (!settings.allPairAddresses || settings.allPairAddresses.length <= 1) {
+    const validPairs = await getAllValidPairs(settings.tokenAddress, chain);
+    if (validPairs.length > 0) {
+      settings.allPairAddresses = validPairs.map((p) => p.address);
+      console.log(
+        `🔎 Auto-filled ${validPairs.length} pools from DexScreener for ${settings.tokenAddress}`
+      );
+    }
+  }
+
   const targetToken = settings.tokenAddress.toLowerCase();
 
   const isToken0 = tokens.token0 === targetToken;
@@ -156,16 +239,17 @@ async function handleSwap(
 
   const baseAmount = parseFloat(ethers.utils.formatUnits(baseIn, 18));
 
-  // ---- Real 24h Volume + MC + Price (2025 fix) ----
+  // ---- Real 24h Volume + MC + Price (pair-specific) ----
   let priceUsd = 0;
   let marketCap = 0;
   let volume24h = 0;
   let tokenSymbol = "TOKEN";
   let tokenDecimals = 18;
+  let pairLiquidityUsd = 0;
 
   try {
     const res = await fetch(
-      `https://api.dexscreener.com/latest/dex/pairs/${chain}/${settings.pairAddress}`
+      `https://api.dexscreener.com/latest/dex/pairs/${chain}/${pairAddress}`
     );
     const data: any = await res.json();
 
@@ -191,32 +275,26 @@ async function handleSwap(
 
       marketCap = p.fdv || 0;
       volume24h = p.volume?.h24 || 0;
+      pairLiquidityUsd = p.liquidity?.usd || 0;
     }
   } catch (e) {
     console.error("DexScreener fetch failed:", e);
   }
 
-  // fallback MC (very rough)
   if (marketCap === 0 && priceUsd > 0) {
-    const totalSupply = 1_000_000_000_000_000; // assume 1T supply memes
+    const totalSupply = 1_000_000_000_000_000;
     marketCap = priceUsd * totalSupply;
   }
 
-  // Native token price (BNB / ETH) from Binance
-  const nativePriceUsd =
-    String(chain).toLowerCase() === "bsc"
-      ? await getBnbPrice()
-      : await getEthPrice();
+  const nativePriceUsd = await getNativePrice(chain);
 
   const usdValue = baseAmount * nativePriceUsd;
 
-  // token amount from on-chain amount + decimals
   const tokenAmount = parseFloat(
     ethers.utils.formatUnits(tokenOut, tokenDecimals)
   );
 
-  // Position increase based on previous balance
-  const buyer = ethers.utils.getAddress(to); // checksum
+  const buyer = ethers.utils.getAddress(to);
   const prevBalance = await getPreviousBalance(
     chain,
     settings.tokenAddress,
@@ -228,7 +306,7 @@ async function handleSwap(
   let positionIncrease: number | null = null;
   if (prevBalance > 0n) {
     const diff = currentBalance - prevBalance;
-    const increase = Number((diff * 1000n) / prevBalance) / 10; // 1 decimal
+    const increase = Number((diff * 1000n) / prevBalance) / 10;
     positionIncrease = Math.round(increase);
   }
 
@@ -244,7 +322,9 @@ async function handleSwap(
       positionIncrease,
       marketCap,
       volume24h,
-      priceUsd
+      priceUsd,
+      pairAddress,
+      pairLiquidityUsd
     };
 
     await sendPremiumBuyAlert(bot, groupId, s, alertData);
@@ -267,7 +347,9 @@ async function sendPremiumBuyAlert(
     buyer,
     positionIncrease,
     marketCap,
-    volume24h
+    volume24h,
+    pairAddress,
+    pairLiquidityUsd
   } = data;
 
   const buyUsd = Math.round(usdValue);
@@ -275,12 +357,37 @@ async function sendPremiumBuyAlert(
   if (settings.maxBuyUsd && buyUsd > settings.maxBuyUsd) return;
 
   const chainStr = String(chain).toLowerCase();
-  const baseSymbol =
-    chainStr === "bsc"
-      ? "BNB"
-      : chainStr.includes("eth")
-      ? "ETH"
-      : "NATIVE";
+
+  // Chain অনুযায়ী emoji + symbol
+  let baseEmoji = "";
+  let baseSymbolText = "";
+
+  if (chainStr === "bsc") {
+    baseEmoji = "🟡";
+    baseSymbolText = "BNB";
+  } else if (
+    chainStr === "ethereum" ||
+    chainStr === "eth" ||
+    chainStr === "mainnet"
+  ) {
+    baseEmoji = "🔹";
+    baseSymbolText = "ETH";
+  } else if (chainStr === "base") {
+    baseEmoji = "🟦";
+    baseSymbolText = "ETH";
+  } else if (chainStr === "arbitrum" || chainStr === "arb") {
+    baseEmoji = "🌀";
+    baseSymbolText = "ETH";
+  } else if (chainStr === "solana" || chainStr === "sol") {
+    baseEmoji = "🟢";
+    baseSymbolText = "SOL";
+  } else if (chainStr === "polygon" || chainStr === "matic") {
+    baseEmoji = "🟣";
+    baseSymbolText = "MATIC";
+  } else {
+    baseEmoji = "💠";
+    baseSymbolText = "NATIVE";
+  }
 
   const explorerBase =
     appConfig.chains[chain]?.explorer ||
@@ -290,32 +397,46 @@ async function sendPremiumBuyAlert(
 
   const txUrl = `${explorerBase}/tx/${txHash}`;
   const addrUrl = `${explorerBase}/address/${buyer}`;
+  const pairLink = `${explorerBase}/address/${pairAddress}`;
 
-  // Emoji bar
+  // Emoji bar (no count text – শুধু bar)
   const emojiCount = Math.floor(
     buyUsd / (settings.dollarsPerEmoji || 50)
   );
-  const emojiBar = settings.emoji.repeat(
-    Math.min(50, emojiCount)
-  );
+  const emojiBar = settings.emoji.repeat(Math.min(50, emojiCount));
 
   const mcText = marketCap > 0 ? (marketCap / 1_000_000).toFixed(2) : "0.00";
 
+  // Main pair এর LP নিয়ে নে (সবচেয়ে বেশি liquidity)
+  let mainPairLp = pairLiquidityUsd;
+  try {
+    if (settings.allPairAddresses && settings.allPairAddresses.length > 0) {
+      const mainPairs = await getAllValidPairs(settings.tokenAddress, chain);
+      if (mainPairs.length > 0) {
+        mainPairLp = mainPairs[0].liquidityUsd;
+      }
+    }
+  } catch {
+    // ignore — fallback pairLiquidityUsd
+  }
+
+  const lpText =
+    mainPairLp > 0 ? (mainPairLp / 1_000_000).toFixed(2) : "0.00";
+
   const whaleLoadLine =
     positionIncrease !== null && positionIncrease > 500
-      ? "🚀🚀 <b>WHALE LOADING HEAVILY!</b> 🚀🚀\n"
+      ? "🚀 <b>WHALE LOADING HEAVILY!</b>\n"
       : "";
 
   const volumeLine = `🔥 Volume (24h): $${volume24h >= 1_000_000
     ? (volume24h / 1_000_000).toFixed(1) + "M"
     : (volume24h / 1_000).toFixed(0) + "K"}`;
 
-  // একটাই header – এখানে আর আলাদা New Buy লাইন নেই
   const headerLine =
     buyUsd >= 5000
-      ? "🐳🐳 <b>WHALE INCOMING!!!</b> 🐳🐳"
+      ? "🐳🐳🐳 <b>WHALE INCOMING!!!</b> 🐳🐳🐳"
       : buyUsd >= 3000
-      ? "🚨 <b>BIG BUY DETECTED!</b> 🚨"
+      ? "🚨🚨🚨 <b>BIG BUY DETECTED!</b> 🚨🚨🚨"
       : buyUsd >= 1000
       ? "🟢🟢🟢 <b>Strong Buy</b> 🟢🟢🟢"
       : "🟢 <b>New Buy</b> 🟢";
@@ -326,13 +447,17 @@ ${whaleLoadLine}
 💰 <b>$${buyUsd.toLocaleString()}</b> ${tokenSymbol} BUY
 ${emojiBar}
 
-🔸 ${baseSymbol}: ${baseAmount.toFixed(4)} ($${buyUsd.toLocaleString()})
+${baseEmoji} <b>${baseSymbolText}:</b> ${baseAmount.toFixed(
+    4
+  )} ($${buyUsd.toLocaleString()})
 💳 ${tokenSymbol}: ${Math.round(tokenAmount)
     .toString()
     .replace(/\B(?=(\d{3})+(?!\d))/g, ",")}
 
+🔗 Pair: <a href="${pairLink}">${shorten(pairAddress, 10)}</a> → $${lpText}M LP
+
 👤 Buyer: <a href="${addrUrl}">${shorten(buyer)}</a>
-🧾 <a href="${txUrl}">View Transaction</a>
+🔶 <a href="${txUrl}">View Transaction</a>
 ${
   positionIncrease !== null
     ? `🧠 <b>Position Increased: +${positionIncrease.toFixed(0)}%</b>\n`
@@ -353,12 +478,12 @@ ${volumeLine}
         { text: "📈 DexTools", url: dexToolsUrl }
       ],
       settings.tgGroupLink
-        ? [{ text: "👥 Join Token Group", url: settings.tgGroupLink }]
+        ? [{ text: "👥 Join Alpha Group", url: settings.tgGroupLink }]
         : [],
       [
         {
           text: "✉️ DM for Access",
-          url: "https://t.me/yourusername" // নিজের username দে
+          url: "https://t.me/yourusername" // নিজের username বসাও
         }
       ]
     ].filter((row: any[]) => row.length > 0)
@@ -411,27 +536,67 @@ function shorten(addr: string, len = 6): string {
 
 /* ========= Extra helpers ========= */
 
-async function getBnbPrice(): Promise<number> {
+// DexScreener theke sob valid pair + LP fetch
+async function getAllValidPairs(
+  tokenAddress: string,
+  chain: ChainId
+): Promise<Array<{ address: string; liquidityUsd: number }>> {
   try {
     const res = await fetch(
-      "https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT"
+      `https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`
     );
     const data: any = await res.json();
-    return parseFloat(data.price);
-  } catch {
-    return 600; // fallback
+
+    if (!data.pairs || data.pairs.length === 0) return [];
+
+    return data.pairs
+      .filter(
+        (p: any) =>
+          // MUST: chain match kora – na hole onnano chain er pools mix hoye jay
+          p.chainId === chain &&
+          (
+            p.baseToken.address.toLowerCase() === tokenAddress.toLowerCase() ||
+            p.quoteToken.address.toLowerCase() === tokenAddress.toLowerCase()
+          )
+      )
+      .filter((p: any) => p.liquidity?.usd > 1000)
+      .map((p: any) => ({
+        address: p.pairAddress,
+        liquidityUsd: p.liquidity?.usd || 0
+      }))
+      .sort((a: any, b: any) => b.liquidityUsd - a.liquidityUsd);
+  } catch (e: any) {
+    console.error(
+      `❌ getAllValidPairs error for token ${tokenAddress} on ${chain}: ${
+        e?.message || e
+      }`
+    );
+    return [];
   }
 }
 
-async function getEthPrice(): Promise<number> {
-  try {
-    const res = await fetch(
-      "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
-    );
-    const data: any = await res.json();
-    return parseFloat(data.price);
-  } catch {
-    return 3000; // fallback
+// getBnbPrice → getNativePrice: chain onujayi auto detect
+async function getNativePrice(chain: ChainId): Promise<number> {
+  if (chain === "bsc") {
+    try {
+      const res = await fetch(
+        "https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT"
+      );
+      const data: any = await res.json();
+      return parseFloat(data.price);
+    } catch {
+      return 875;
+    }
+  } else {
+    try {
+      const res = await fetch(
+        "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+      );
+      const data: any = await res.json();
+      return parseFloat(data.price);
+    } catch {
+      return 3400;
+    }
   }
 }
 
@@ -456,7 +621,7 @@ async function getPreviousBalance(
       blockTag: block
     });
     return balance.toBigInt();
-  } catch (e) {
+  } catch {
     return 0n;
   }
 }

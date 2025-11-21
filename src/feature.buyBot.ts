@@ -5,6 +5,7 @@ import {
   fetchTokenPairs,
   DexPair
 } from "./rpcAndApi";
+import fetch from "node-fetch";
 
 export interface BuyBotSettings {
   chain: ChainId;
@@ -82,7 +83,7 @@ export function registerBuyBotFeature(bot: Telegraf<BotCtx>) {
 
       await ctx.reply(
         "🕵️ <b>Premium Buy Bot Setup</b>\n\n" +
-          "1️⃣ Send your <b>token contract address</b>.\n" +
+          "1️⃣ Send your <b>token contract address</b>\n" +
           "I'll auto-detect <u>all pools</u> from DexScreener and pick the main one.",
         { parse_mode: "HTML" }
       );
@@ -410,12 +411,91 @@ async function runSetupStep(
 ): Promise<void> {
   switch (state.step) {
     case "token": {
-      state.settings.tokenAddress = text;
+      const tokenAddr = text.trim();
+      state.settings.tokenAddress = tokenAddr.toLowerCase();
+
+      // 🔍 Auto-detect chain from DexScreener before fetching pools
+      if (/^0x[a-fA-F0-9]{40}$/.test(tokenAddr)) {
+        try {
+          const tokenUrl = `https://api.dexscreener.com/latest/dex/tokens/${tokenAddr}`;
+          let res = await fetch(tokenUrl);
+          let data: any = await res.json();
+
+          let pairs: any[] = Array.isArray(data.pairs) ? data.pairs : [];
+
+          // Debug – console e raw structure dekhte পারবি
+          console.log(
+            "DexScreener raw token response first pair:",
+            JSON.stringify(pairs[0])
+          );
+
+          // tokens endpoint e jodi na paoa jay, search diye fallback
+          if (!pairs.length) {
+            const searchUrl = `https://api.dexscreener.com/latest/dex/search?q=${tokenAddr}`;
+            const searchRes = await fetch(searchUrl);
+            const searchData: any = await searchRes.json();
+            if (Array.isArray(searchData.pairs)) {
+              pairs = searchData.pairs;
+              console.log(
+                "Using DexScreener search() result, first pair:",
+                JSON.stringify(pairs[0])
+              );
+            }
+          }
+
+          if (pairs.length > 0) {
+            let detectedChain: any =
+              pairs[0].chainId ??
+              pairs[0].chain?.id ??
+              pairs[0].chainName ??
+              pairs[0].chain?.name;
+
+            if (detectedChain) {
+              detectedChain = String(detectedChain).toLowerCase();
+
+              // normalize common variants
+              if (detectedChain === "eth") detectedChain = "ethereum";
+              if (detectedChain === "bnb" || detectedChain === "bsc")
+                detectedChain = "bsc";
+              if (detectedChain === "arb") detectedChain = "arbitrum";
+              if (detectedChain === "matic") detectedChain = "polygon";
+              if (detectedChain === "avax") detectedChain = "avalanche";
+            }
+
+            const supportedChains = [
+              "ethereum",
+              "bsc",
+              "base",
+              "arbitrum",
+              "polygon",
+              "avalanche"
+            ];
+
+            if (detectedChain && supportedChains.includes(detectedChain)) {
+              state.settings.chain = detectedChain as ChainId;
+              await ctx.reply(
+                `🛰 <b>Detected chain:</b> <code>${detectedChain.toUpperCase()}</code>`,
+                { parse_mode: "HTML" }
+              );
+            } else {
+              console.log(
+                "Unsupported/unknown chain from DexScreener:",
+                detectedChain
+              );
+            }
+          } else {
+            console.log("No pairs in DexScreener token+search response");
+          }
+        } catch (e) {
+          console.error("Chain auto-detect failed:", e);
+        }
+      }
+
       const chain = state.settings.chain || appConfig.defaultChain;
 
       await ctx.reply("🔎 Fetching pools from DexScreener…");
 
-      const pairs = await fetchTokenPairs(chain, text);
+      const pairs = await fetchTokenPairs(chain, tokenAddr);
       if (!pairs.length) {
         state.step = "pair";
         await ctx.reply(
@@ -445,9 +525,12 @@ async function runSetupStep(
         summary += `<b>Other pools (top liq):</b>\n${others}\n\n`;
       }
 
-      await ctx.reply(summary + "3️⃣ Now send a <b>buy emoji</b> (e.g. 🐶, 🧠, 🚀).", {
-        parse_mode: "HTML"
-      });
+      await ctx.reply(
+        summary + "3️⃣ Now send a <b>buy emoji</b> (e.g. 🐶, 🧠, 🚀).",
+        {
+          parse_mode: "HTML"
+        }
+      );
 
       state.step = "emoji";
       return;
@@ -562,7 +645,7 @@ async function runSetupStep(
         dollarsPerEmoji: state.settings.dollarsPerEmoji ?? 50,
         tgGroupLink: state.settings.tgGroupLink,
         autoPinDataPosts: state.settings.autoPinDataPosts ?? false,
-        autoPinKolAlerts: state.settings.autoPinKolAlerts ?? false,
+        autoPinKolAlerts: state.settings.autoPinKolAlerts ?? false
       };
 
       const targetGroupId =

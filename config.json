@@ -4,14 +4,14 @@
 
   "defaultChain": "bsc",
 
-  "chains": {
-    "bsc": {
-      "rpcUrl": "wss://old-palpable-choice.bsc.quiknode.pro/1b9062cadf4275a08693a6800c7edbf222c95f82/",
-      "explorer": "https://bscscan.com"
-    },
-    "ethereum": {
-      "rpcUrl": "wss://proportionate-falling-morning.quiknode.pro/ef340006d869e9351618f50a21e0651af780c88a",
-      "explorer": "https://etherscan.io"
-    }
+"chains": {
+  "bsc": {
+    "rpcUrl": "wss://old-palpable-choice.bsc.quiknode.pro/1b9062cadf4275a08693a6800c7edbf222c95f82/",
+    "explorer": "https://bscscan.com"
+  },
+  "ethereum": {
+    "rpcUrl": "wss://sleek-fabled-resonance.quiknode.pro/8c34002709886a435ea6a629bdc8c1ca04c86cd3/",
+    "explorer": "https://etherscan.io"
   }
+}
 }
